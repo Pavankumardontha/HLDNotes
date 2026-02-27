@@ -19,6 +19,8 @@
   - [Cache Eviction Policies](#cache-eviction-policies)
 - [Cache Persistence](#cache-persistence)
 - [Redis](#redis)
+  - [Redis is Single-Threaded](#redis-is-single-threaded)
+  - [How Redis Handles Concurrent Requests](#how-redis-handles-concurrent-requests)
   - [Redis Persistence](#redis-persistence)
   - [Append-Only Files (AOF)](#append-only-files-aof)
   - [Point-in-Time Backups (RDB)](#point-in-time-backups-rdb)
@@ -276,6 +278,73 @@ It is possible to implement a persistent cache in volatile memory, as long as th
 ## Redis
 
 **Redis** can operate as either a **volatile** or **persistent** cache. It uses **RAM** for its primary memory storage, making it act like a volatile cache, yet permanent storage can be used to provide the persistent backup and rehydration, so that Redis can be used as a persistent cache.
+
+### Redis is Single-Threaded
+
+Redis uses a **single thread** to handle all read and write commands. Every command — `GET`, `SET`, `DEL`, etc. — is executed sequentially by one thread, one after another.
+
+**Why single-threaded?**
+
+- **No race conditions** — since only one thread processes commands, there's no possibility of two operations modifying the same key at the same time.
+- **No lock overhead** — no time wasted acquiring/releasing locks.
+- **Atomic by default** — every Redis command is inherently atomic because nothing else can interrupt it mid-execution.
+
+**How is it still so fast?**
+
+- All data is in **RAM** — no disk I/O for reads/writes.
+- Operations are extremely simple — each command completes in **microseconds**.
+- The bottleneck is usually the **network**, not the CPU.
+
+Starting with Redis 6, Redis uses **multiple I/O threads** for reading requests from the network and writing responses back. But the **actual command execution** is still single-threaded.
+
+### How Redis Handles Concurrent Requests
+
+When multiple clients send commands at the same time, the second command doesn't get lost — it sits in a **queue**. Redis uses an **event loop** (based on `epoll`/`kqueue`) to handle connections:
+
+1. The **OS TCP buffers** hold incoming data for each client connection.
+2. The Redis event loop detects which connections have data ready to be read.
+3. It reads the commands and places them into an **internal execution queue**.
+4. The single thread picks up commands **one by one**, executes each, and sends the response back.
+
+```
+  Client A: GET key1 ──┐
+                       ▼
+               ┌─────────────────┐
+               │  OS TCP Buffers │  (network layer holds
+               │  ┌─────────────┐│   incoming bytes until
+  Client B: ──►│  │ Client A buf││   Redis reads them)
+  GET key2     │  │ Client B buf││
+               │  └─────────────┘│
+               └────────┬────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │   Event Loop    │  (detects which sockets
+               │   (epoll/kqueue)│   have data ready)
+               └────────┬────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │  Command Queue  │
+               │  ┌─────────────┐│
+               │  │ 1. GET key1 ││  <-- picked up first
+               │  │ 2. GET key2 ││  <-- waits its turn
+               │  └─────────────┘│
+               └────────┬────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │  Single Thread  │
+               │  executes one   │
+               │  command at a   │
+               │  time           │
+               └────────┬────────┘
+                        │
+                 1. Execute GET key1 --> respond to Client A
+                 2. Execute GET key2 --> respond to Client B
+```
+
+A typical Redis `GET` command takes about **1-2 microseconds** to execute. So even though the second command is "waiting," it waits for about **1 microsecond**. At this speed, Redis can process **100,000+ commands per second** sequentially, and the waiting time is imperceptible. The latency you actually feel is almost entirely **network round-trip time** (milliseconds), not the queuing time (microseconds).
 
 ### Redis Persistence
 
